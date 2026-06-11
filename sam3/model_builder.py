@@ -74,10 +74,19 @@ def _create_position_encoding(precompute_resolution=None):
     )
 
 
-def _create_vit_backbone(compile_mode=None, use_fa3=False, use_rope_real=False):
-    """Create ViT backbone for visual feature extraction."""
+def _create_vit_backbone(
+    img_size=1008, compile_mode=None, use_fa3=False, use_rope_real=False
+):
+    """Create ViT backbone for visual feature extraction.
+
+    Args:
+        img_size: Input image size. Smaller values = faster inference.
+                  - 1008 (default): Best accuracy, slowest
+                  - 672: ~2.25x faster, good accuracy
+                  - 512: ~4x faster, lower accuracy
+    """
     return ViT(
-        img_size=1008,
+        img_size=img_size,
         pretrain_img_size=336,
         patch_size=14,
         embed_dim=1024,
@@ -510,13 +519,17 @@ def _create_text_encoder(bpe_path: str) -> VETextEncoder:
 
 
 def _create_vision_backbone(
-    compile_mode=None, enable_inst_interactivity=True
+    img_size=1008, compile_mode=None, enable_inst_interactivity=True
 ) -> Sam3DualViTDetNeck:
-    """Create SAM3 visual backbone with ViT and neck."""
+    """Create SAM3 visual backbone with ViT and neck.
+    
+    Args:
+        img_size: Input image size (default: 1008)
+    """
     # Position encoding
-    position_encoding = _create_position_encoding(precompute_resolution=1008)
+    position_encoding = _create_position_encoding(precompute_resolution=img_size)
     # ViT backbone
-    vit_backbone: ViT = _create_vit_backbone(compile_mode=compile_mode)
+    vit_backbone: ViT = _create_vit_backbone(img_size=img_size, compile_mode=compile_mode)
     vit_neck: Sam3DualViTDetNeck = _create_vit_neck(
         position_encoding,
         vit_backbone,
@@ -553,11 +566,24 @@ def _load_checkpoint(model, checkpoint_path):
                 if "tracker" in k
             }
         )
-    missing_keys, _ = model.load_state_dict(sam3_image_ckpt, strict=False)
-    if len(missing_keys) > 0:
+    
+    # Remove RoPE position embeddings that don't match the model's image size
+    # These will be recomputed automatically by the model
+    keys_to_remove = [k for k in sam3_image_ckpt.keys() if "freqs_cis" in k]
+    for k in keys_to_remove:
+        # Check if shape matches, only remove if mismatch
+        if k in model.state_dict() and sam3_image_ckpt[k].shape != model.state_dict()[k].shape:
+            del sam3_image_ckpt[k]
+    
+    missing_keys, unexpected_keys = model.load_state_dict(sam3_image_ckpt, strict=False)
+    
+    # Filter out expected missing keys (RoPE embeddings for different resolutions)
+    important_missing = [k for k in missing_keys if "freqs_cis" not in k and "pos_embed" not in k.lower()]
+    
+    if len(important_missing) > 0:
         print(
             f"loaded {checkpoint_path} and found "
-            f"missing and/or unexpected keys:\n{missing_keys=}"
+            f"missing important keys:\n{important_missing=}"
         )
 
 
@@ -579,6 +605,7 @@ def build_sam3_image_model(
     enable_segmentation=True,
     enable_inst_interactivity=False,
     compile=False,
+    img_size=1008,
 ):
     """
     Build SAM3 image model
@@ -588,12 +615,21 @@ def build_sam3_image_model(
         device: Device to load the model on ('cuda' or 'cpu')
         eval_mode: Whether to set the model to evaluation mode
         checkpoint_path: Optional path to model checkpoint
+        load_from_HF: Whether to load checkpoint from HuggingFace
         enable_segmentation: Whether to enable segmentation head
         enable_inst_interactivity: Whether to enable instance interactivity (SAM 1 task)
-        compile_mode: To enable compilation, set to "default"
+        compile: To enable compilation, set to True
+        img_size: Input image resolution. Smaller = faster inference.
+                  - 1008 (default): Best accuracy, baseline speed
+                  - 672: ~2.25x faster, good accuracy (recommended for speed)
+                  - 512: ~4x faster, lower accuracy
 
     Returns:
         A SAM3 image model
+        
+    Note:
+        When using img_size != 1008, make sure to set the same resolution
+        in Sam3Processor: processor = Sam3Processor(model, resolution=img_size)
     """
     if bpe_path is None:
         bpe_path = pkg_resources.resource_filename(
@@ -603,7 +639,9 @@ def build_sam3_image_model(
     # Create visual components
     compile_mode = "default" if compile else None
     vision_encoder = _create_vision_backbone(
-        compile_mode=compile_mode, enable_inst_interactivity=enable_inst_interactivity
+        img_size=img_size,
+        compile_mode=compile_mode, 
+        enable_inst_interactivity=enable_inst_interactivity
     )
 
     # Create text components
@@ -650,6 +688,13 @@ def build_sam3_image_model(
 
     # Setup device and mode
     model = _setup_device_and_mode(model, device, eval_mode)
+    
+    # Log configuration
+    if img_size != 1008:
+        print(f"\n✓ Built SAM3 model with img_size={img_size} (faster inference)")
+        print(f"  Expected speedup: ~{(1008/img_size)**2:.1f}x vs img_size=1008")
+        print(f"  RoPE embeddings adapted to new resolution")
+        print(f"  Remember to use: Sam3Processor(model, resolution={img_size})")
 
     return model
 
