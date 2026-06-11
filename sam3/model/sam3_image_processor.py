@@ -343,12 +343,22 @@ class Sam3Processor:
     def _forward_grounding(self, state: Dict):
         """Single prompt forward grounding (backward compatibility)."""
         start = time.time()
-        outputs = self.model.forward_grounding(
-            backbone_out=state["backbone_out"],
-            find_input=self.find_stage,
-            geometric_prompt=state["geometric_prompt"],
-            find_target=None,
-        )
+        
+        # Temporarily detach the segmentation head so SAM3 skips mask generation
+        original_seg_head = self.model.segmentation_head
+        self.model.segmentation_head = None
+        
+        try:
+            with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
+                outputs = self.model.forward_grounding(
+                    backbone_out=state["backbone_out"],
+                    find_input=self.find_stage,
+                    geometric_prompt=state["geometric_prompt"],
+                    find_target=None,
+                )
+        finally:
+            self.model.segmentation_head = original_seg_head
+            
         print("time taken to generate bboxes:", round(time.time() - start, 4), "seconds")
         
         out_bbox = outputs["pred_boxes"]
@@ -407,13 +417,21 @@ class Sam3Processor:
             input_points_mask=None,
         )
         
-        # Run model once for all prompts
-        outputs = self.model.forward_grounding(
-            backbone_out=state["backbone_out"],
-            find_input=batched_find_stage,
-            geometric_prompt=state["geometric_prompt"],
-            find_target=None,
-        )
+        # Temporarily detach the segmentation head so SAM3 skips mask generation
+        original_seg_head = self.model.segmentation_head
+        self.model.segmentation_head = None
+        
+        try:
+            with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
+                outputs = self.model.forward_grounding(
+                    backbone_out=state["backbone_out"],
+                    find_input=batched_find_stage,
+                    geometric_prompt=state["geometric_prompt"],
+                    find_target=None,
+                )
+        finally:
+            self.model.segmentation_head = original_seg_head
+            
         print("time taken to generate bboxes (batched):", round(time.time() - start, 4), "seconds")
         
         # outputs shape: [num_prompts, num_queries, ...]
